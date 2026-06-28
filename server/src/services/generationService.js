@@ -1,9 +1,11 @@
 // server/src/services/generationService.js
 // Orchestrates the complete test generation pipeline
-// Coordinates promptBuilder → groqService → MongoDB storage
+// Now includes embedding storage and similarity search for memory system
 
 const { buildTestGenerationPrompt, buildRegenerationPrompt } = require('../ai/promptBuilder');
 const { generateWithGroq } = require('../ai/groqService');
+const { storeEmbedding } = require('../embeddings/embeddingService');
+const { findSimilarGenerations, buildContextFromSimilar } = require('../embeddings/similaritySearch');
 const Generation = require('../models/Generation');
 const Project = require('../models/Project');
 
@@ -11,18 +13,9 @@ const Project = require('../models/Project');
 // ============================================
 // MAIN FUNCTION — generateTests
 // ============================================
-// Takes a project ID and testing parameters
-// Runs the full generation pipeline
-// Saves results to MongoDB
-// Returns the complete generation result
-//
-// PARAMETERS:
-// projectId      — MongoDB ID of the project
-// userId         — MongoDB ID of the requesting user
-// testingGoal    — what the user wants to test
-// generationType — type of tests to generate
-// codeSnippet    — optional specific code to focus on
-// instructions   — optional extra instructions
+// Now includes:
+// 1. Similarity search before generation (retrieves relevant past tests)
+// 2. Embedding storage after generation (saves for future use)
 // ============================================
 const generateTests = async ({
     projectId,
@@ -39,14 +32,12 @@ const generateTests = async ({
         // ============================================
         // STEP 1 — FETCH PROJECT AND ANALYSIS
         // ============================================
-        // Get the project document which contains all analysis results
         const project = await Project.findById(projectId);
 
         if (!project) {
             throw new Error('Project not found');
         }
 
-        // Parse the stored routes JSON string back into an array
         let routes = [];
         try {
             routes = JSON.parse(project.detectedRoutes || '[]');
@@ -54,7 +45,6 @@ const generateTests = async ({
             routes = [];
         }
 
-        // Build the analysis object from stored project data
         const analysis = {
             technologies: project.detectedTechnologies || [],
             routes: routes,
@@ -64,9 +54,45 @@ const generateTests = async ({
 
 
         // ============================================
-        // STEP 2 — BUILD THE PROMPT
+        // STEP 2 — SIMILARITY SEARCH (MEMORY SYSTEM)
         // ============================================
-        // Use promptBuilder to create a detailed context-aware prompt
+        // Search for similar past generations BEFORE building the prompt
+        // This is what makes the platform get smarter over time
+        console.log('Searching for similar past generations...');
+        let similarContext = '';
+
+        try {
+            const similarGenerations = await findSimilarGenerations({
+                testingGoal,
+                projectId,
+                userId,
+                topN: 3,
+                threshold: 0.5
+            });
+
+            // Build context string from similar generations
+            similarContext = buildContextFromSimilar(similarGenerations);
+
+            if (similarGenerations.length > 0) {
+                console.log(`Found ${similarGenerations.length} similar past generations to use as context`);
+            } else {
+                console.log('No similar past generations found — generating fresh');
+            }
+        } catch (searchError) {
+            // Non-critical — continue without context if search fails
+            console.warn('Similarity search failed, continuing without context:', searchError.message);
+        }
+
+
+        // ============================================
+        // STEP 3 — BUILD THE PROMPT
+        // ============================================
+        // Include similar context in the instructions
+        // This injects the memory system's findings into the prompt
+        const enhancedInstructions = instructions
+            ? instructions + '\n' + similarContext
+            : similarContext;
+
         console.log('Building generation prompt...');
         const prompt = buildTestGenerationPrompt({
             project,
@@ -74,23 +100,20 @@ const generateTests = async ({
             testingGoal,
             generationType,
             codeSnippet,
-            instructions
+            instructions: enhancedInstructions
         });
 
 
         // ============================================
-        // STEP 3 — SEND TO GROQ
+        // STEP 4 — SEND TO GROQ
         // ============================================
-        // Send the prompt to Groq and get back generated tests
         console.log('Sending to Groq AI...');
         const generatedContent = await generateWithGroq(prompt);
 
 
         // ============================================
-        // STEP 4 — SAVE TO MONGODB
+        // STEP 5 — SAVE TO MONGODB
         // ============================================
-        // Store the generation in the database
-        // This enables history, export, and regeneration features
         console.log('Saving generation to database...');
         const generation = await Generation.create({
             projectId,
@@ -108,13 +131,37 @@ const generateTests = async ({
 
 
         // ============================================
-        // STEP 5 — RETURN RESULTS
+        // STEP 6 — STORE EMBEDDING (MEMORY SYSTEM)
+        // ============================================
+        // Store the generation as an embedding AFTER saving
+        // This runs asynchronously — we don't wait for it
+        // So it doesn't slow down the response to the user
+        // The next generation will benefit from this embedding
+        storeEmbedding({
+            generation,
+            projectId,
+            userId,
+            technologies: project.detectedTechnologies || []
+        }).then(() => {
+            console.log('Embedding stored successfully for future use');
+        }).catch(err => {
+            console.warn('Embedding storage failed (non-critical):', err.message);
+        });
+        // Note: we use .then().catch() instead of await
+        // This means the embedding stores in the background
+        // The user gets their tests immediately without waiting
+
+
+        // ============================================
+        // STEP 7 — RETURN RESULTS
         // ============================================
         console.log(`Generation complete for project: ${projectId}`);
         return {
             generation,
             generatedContent,
-            tokensUsed: prompt.length
+            tokensUsed: prompt.length,
+            usedMemoryContext: similarContext.length > 0
+            // usedMemoryContext tells the frontend if memory was used
         };
 
     } catch (error) {
@@ -127,14 +174,6 @@ const generateTests = async ({
 // ============================================
 // FUNCTION — regenerateTests
 // ============================================
-// Regenerates tests based on a previous generation
-// Called when user clicks the Regenerate button
-//
-// PARAMETERS:
-// generationId           — ID of the previous generation to improve
-// userId                 — ID of the requesting user
-// regenerationInstructions — what to improve or change
-// ============================================
 const regenerateTests = async ({
     generationId,
     userId,
@@ -144,21 +183,18 @@ const regenerateTests = async ({
 
         console.log(`Starting regeneration for generation: ${generationId}`);
 
-        // ---- FETCH THE PREVIOUS GENERATION ----
         const previousGeneration = await Generation.findById(generationId);
 
         if (!previousGeneration) {
             throw new Error('Previous generation not found');
         }
 
-        // ---- FETCH THE PROJECT ----
         const project = await Project.findById(previousGeneration.projectId);
 
         if (!project) {
             throw new Error('Project not found');
         }
 
-        // ---- BUILD ANALYSIS OBJECT ----
         let routes = [];
         try {
             routes = JSON.parse(project.detectedRoutes || '[]');
@@ -172,20 +208,33 @@ const regenerateTests = async ({
             summary: project.repositorySummary || ''
         };
 
-        // ---- BUILD REGENERATION PROMPT ----
-        // This prompt includes context from the previous generation
+        // Search for similar past generations for regeneration too
+        let similarContext = '';
+        try {
+            const similarGenerations = await findSimilarGenerations({
+                testingGoal: previousGeneration.testingGoal,
+                projectId: previousGeneration.projectId,
+                userId,
+                topN: 2,
+                threshold: 0.6
+            });
+            similarContext = buildContextFromSimilar(similarGenerations);
+        } catch (err) {
+            console.warn('Similarity search failed for regeneration');
+        }
+
+        const enhancedInstructions = regenerationInstructions + '\n' + similarContext;
+
         const prompt = buildRegenerationPrompt({
             project,
             analysis,
             testingGoal: previousGeneration.testingGoal,
             previousGeneration: previousGeneration.generatedContent,
-            regenerationInstructions
+            regenerationInstructions: enhancedInstructions
         });
 
-        // ---- SEND TO GROQ ----
         const generatedContent = await generateWithGroq(prompt);
 
-        // ---- SAVE NEW GENERATION ----
         const newGeneration = await Generation.create({
             projectId: previousGeneration.projectId,
             userId,
@@ -198,7 +247,17 @@ const regenerateTests = async ({
             parentGenerationId: generationId
         });
 
-        console.log(`Regeneration complete`);
+        // Store embedding for the regenerated tests too
+        storeEmbedding({
+            generation: newGeneration,
+            projectId: previousGeneration.projectId,
+            userId,
+            technologies: project.detectedTechnologies || []
+        }).catch(err => {
+            console.warn('Embedding storage failed for regeneration:', err.message);
+        });
+
+        console.log('Regeneration complete');
         return {
             generation: newGeneration,
             generatedContent
@@ -214,18 +273,12 @@ const regenerateTests = async ({
 // ============================================
 // FUNCTION — getProjectGenerations
 // ============================================
-// Returns all generations for a specific project
-// Used to show generation history in the workspace
 const getProjectGenerations = async (projectId) => {
     try {
         const generations = await Generation.find({ projectId })
             .sort({ createdAt: -1 })
-            // Sort newest first
             .select('-promptUsed')
-            // Exclude the prompt field — it is large and not needed for listing
             .lean();
-        // .lean() returns plain JavaScript objects instead of Mongoose documents
-        // Faster and uses less memory when we don't need Mongoose methods
 
         return generations;
     } catch (error) {
