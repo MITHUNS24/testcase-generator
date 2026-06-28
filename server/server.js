@@ -23,6 +23,7 @@ const connectDB = require('./src/config/db');
 const authRoutes = require('./src/routes/authRoutes');
 const projectRoutes = require('./src/routes/projectRoutes');
 const repositoryRoutes = require('./src/routes/repositoryRoutes');
+const analysisRoutes = require('./src/routes/analysisRoutes');
 // Create the Express application
 const app = express();
 
@@ -63,6 +64,8 @@ app.use(morgan('dev'));
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/repositories', repositoryRoutes);
+app.use('/api/analysis', analysisRoutes);
+
 // Health check route — used to verify server is running
 // Visit http://localhost:5000/api/health in browser to test
 app.get('/api/health', (req, res) => {

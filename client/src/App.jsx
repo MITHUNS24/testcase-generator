@@ -14,7 +14,7 @@ import LandingPage from './pages/LandingPage'
 import LoginPage from './pages/LoginPage'
 import SignupPage from './pages/SignupPage'
 import Dashboard from './pages/Dashboard'
-
+import ProjectWorkspace from './pages/ProjectWorkspace'
 
 // ============================================
 // PROTECTED ROUTE COMPONENT
@@ -114,6 +114,14 @@ const App = () => {
         element={
           <ProtectedRoute>
             <Dashboard />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/projects/:id"
+        element={
+          <ProtectedRoute>
+            <ProjectWorkspace />
           </ProtectedRoute>
         }
       />
